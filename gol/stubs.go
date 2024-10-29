@@ -1,13 +1,15 @@
 package gol
 
+import "uk.ac.bris.cs/gameoflife/util"
+
 var CalculateNext = "GameOfLifeOperations.NextState"
 
 type Response struct {
-	newworld [][]byte
+	NewWorld        [][]byte
+	AliveCellsCount []util.Cell
 }
 
 type Request struct {
-	p     Params
-	world [][]byte
-	c     distributorChannels
+	P     Params
+	World [][]byte
 }
