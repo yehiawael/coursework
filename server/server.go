@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"net"
 	"net/rpc"
+	"os"
+	"sync"
 	"uk.ac.bris.cs/gameoflife/gol"
 	"uk.ac.bris.cs/gameoflife/util"
 
@@ -61,47 +63,98 @@ func calculateAliveCells(p gol.Params, world [][]byte) []util.Cell {
 
 	for w := 0; w < p.ImageWidth; w++ {
 		for h := 0; h < p.ImageHeight; h++ {
-
-			//fmt.Println(world[h][w])
 			if world[h][w] == 255 {
 				cellCord := util.Cell{X: w, Y: h}
-				//fmt.Println(h)
-				//fmt.Printf("width : %d", h)
-
 				aliveCells = append(aliveCells, cellCord)
+
 			}
 		}
 
 	}
+
 	return aliveCells
 }
 
-type GameOfLifeOperations struct{}
+//func calculateAliveCells(p gol.Params, world [][]byte) []util.Cell {
+//	height := p.ImageHeight
+//	width := p.ImageWidth
+//	var cells []util.Cell
+//	for w := 0; w < height; w++ {
+//		for h := 0; h < width; h++ {
+//			fmt.Println("inside for loop")
+//			if world[w][h] == 255 {
+//				cells = append(cells, util.Cell{Y: w, X: h})
+//			}
+//		}
+//	}
+//	return cells
+//}
+
+type GameOfLifeOperations struct {
+	world  [][]byte
+	turns  int
+	mu     sync.Mutex
+	paused bool
+}
+
+func (s *GameOfLifeOperations) Paused(req gol.Request, res *gol.Response) (err error) {
+	s.mu.Lock()
+	fmt.Println("Pausing the server...")
+	s.paused = true
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *GameOfLifeOperations) Resume(req gol.Request, res *gol.Response) (err error) {
+	s.mu.Lock()
+	fmt.Println("Resuming the Server...")
+	s.paused = false
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *GameOfLifeOperations) Quit(req gol.Request, res *gol.Response) (err error) {
+	fmt.Println("Received kill command. Shutting down server...")
+
+	// Perform any necessary cleanup here
+	s.turns = 0
+	s.world = nil
+
+	// Exit the program immediately with an exit code of 0 (successful shutdown)
+	os.Exit(0)
+
+	// Note: os.Exit() does not return, so any code after this line is unreachable
+	return nil
+}
+func (s *GameOfLifeOperations) AliveCells(req gol.Request, res *gol.Response) (err error) {
+	fmt.Println("now in alivecells")
+	fmt.Println(req.P.ImageHeight)
+	res.AliveCells = calculateAliveCells(req.P, s.world)
+	fmt.Println("we calculated alivecells")
+	res.AliveCellsCount = len(res.AliveCells)
+	res.Turns = s.turns
+	fmt.Println("finished alivecells")
+	return
+}
 
 func (s *GameOfLifeOperations) NextState(req gol.Request, res *gol.Response) (err error) {
-
-	//if req.Message == "" {
-	//	err = errors.New("A message must be specified")
-	//	return
-	//}
-
-	fmt.Println("Got ImageWidth: ", req.P.ImageWidth, " ", req.P.ImageHeight)
 	turn := 0
-
 	res.NewWorld = req.World
-
-	fmt.Println("before loop")
-
 	for ; turn < req.P.Turns; turn++ {
 
-		fmt.Println("turn: ", turn)
-		res.NewWorld = calculateNextState(req.P, res.NewWorld)
-		fmt.Printf("new world len: %d\n", len(res.NewWorld))
+		paused := s.paused
 
-		fmt.Println("send event successfully")
+		//If paused, wait until resumed
+		for paused {
+			time.Sleep(50 * time.Millisecond) // Check the state periodically so it doesn't abuse the mutex lock
+			paused = s.paused
+		}
+		s.turns = turn
+		s.world = calculateNextState(req.P, res.NewWorld)
+		res.NewWorld = s.world
+
 	}
-	res.AliveCellsCount = calculateAliveCells(req.P, res.NewWorld)
-	fmt.Println("finished!")
+	res.AliveCells = calculateAliveCells(req.P, res.NewWorld)
 
 	return
 }
@@ -130,21 +183,6 @@ func main() {
 
 	fmt.Printf("Server is listening on port %s\n", *pAddr)
 	rpc.Accept(listener)
-
-	//conn, err := listener.Accept()
-	//if err != nil {
-	//	fmt.Printf("Failed to accept connection: %v\n", err)
-	//
-	//}
-
-	//for {
-	//	conn, err := listener.Accept()
-	//	if err != nil {
-	//		fmt.Printf("Failed to accept connection: %v\n", err)
-	//		continue
-	//	}
-	//	go rpc.ServeConn(conn)
-	//}
 
 	// This print statement is optional, as `rpc.Accept()` will block indefinitely.
 	fmt.Println("server stopped listening")

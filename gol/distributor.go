@@ -1,10 +1,13 @@
 package gol
 
+import "C"
 import (
 	"flag"
 	"fmt"
 	"log"
 	"net/rpc"
+	"sync"
+	"time"
 )
 
 type distributorChannels struct {
@@ -16,83 +19,178 @@ type distributorChannels struct {
 	ioInput    <-chan uint8
 }
 
-//func calculateNextState(p Params, world [][]byte) [][]byte {
-//	height := p.ImageHeight
-//	width := p.ImageWidth
-//	newworld := make([][]byte, height)
-//	for i := range newworld {
-//		newworld[i] = make([]byte, width)
-//	}
-//
-//	countliveneighbours := func(x int, y int) int {
-//		livecount := 0
-//		for i := -1; i <= 1; i++ {
-//			for j := -1; j <= 1; j++ {
-//				if i == 0 && j == 0 {
-//					continue
-//				}
-//				newx := (x + i + height) % height
-//				newy := (y + j + width) % width
-//				if world[newx][newy] == 255 {
-//					livecount++
-//				}
-//			}
-//		}
-//		return livecount
-//	}
-//	for x := 0; x < height; x++ {
-//		for y := 0; y < width; y++ {
-//			lives := countliveneighbours(x, y)
-//			if world[x][y] == 255 {
-//				if lives < 2 || lives > 3 {
-//					newworld[x][y] = 0
-//				}
-//				if lives == 2 || lives == 3 {
-//					newworld[x][y] = 255
-//				}
-//			}
-//			if world[x][y] == 0 {
-//				if lives == 3 {
-//					newworld[x][y] = 255
-//				}
-//			}
-//		}
-//	}
-//	return newworld
-//}
-//
-//
-//
-//func calculateAliveCells(p Params, world [][]byte) []util.Cell {
-//	height := p.ImageHeight
-//	width := p.ImageWidth
-//	var cells []util.Cell
-//	for w := 0; w < height; w++ {
-//		for h := 0; h < width; h++ {
-//			if world[w][h] == 255 {
-//				cells = append(cells, util.Cell{Y: w, X: h})
-//			}
-//		}
-//	}
-//	return cells
-//}
-//
+var worldMu sync.RWMutex // Protect access to the world state
 
-func makeCall(client *rpc.Client, p Params, world [][]byte) Response {
+func saveBoard(p Params, turn int, world [][]byte, c distributorChannels, filename string) {
+	filename = fmt.Sprint(filename, "x", turn)
+	c.ioCommand <- ioOutput
+	c.ioFilename <- filename
+	for i := 0; i < p.ImageHeight; i++ {
+		for j := 0; j < p.ImageWidth; j++ {
+			c.ioOutput <- world[i][j]
+		}
+	}
+	c.ioCommand <- ioCheckIdle
+	<-c.ioIdle
+
+	c.events <- ImageOutputComplete{
+		CompletedTurns: turn,
+		Filename:       filename,
+	}
+
+}
+func handleKeypresses(client *rpc.Client, p Params, res *Response, c distributorChannels, keypresses <-chan rune) {
+	filename := fmt.Sprintf("%dx%d", p.ImageWidth, p.ImageHeight)
+	paused := false
+	//turn := res.Turns
+	turn := 0
+	for key := range keypresses { // Loop over received keypress events
+		switch key {
+		case 's': // Save current state
+			fmt.Println("Saving current state...")
+			worldMu.RLock()
+			saveBoard(p, res.Turns, res.NewWorld, c, filename)
+			worldMu.RUnlock()
+		case 'q': // Quit after saving
+			fmt.Println("Quitting after completing current turn...")
+			worldMu.RLock()
+			saveBoard(p, res.Turns, res.NewWorld, c, filename)
+			worldMu.RUnlock()
+			// Close keypresses channel to stop the loop
+			//close(keypresses)
+			// gracefully close the client
+			client.Close()
+			return
+		case 'k': // Quit after saving
+			fmt.Println("Quitting after k is pressed")
+			worldMu.RLock()
+			saveBoard(p, res.Turns, res.NewWorld, c, filename)
+			worldMu.RUnlock()
+
+			err := client.Call(Kill, Request{}, new(Response))
+			if err != nil {
+				fmt.Println("Error when calling Kill", err)
+			}
+
+			// Close keypresses channel to stop the loop
+			//close(keypresses)
+			// gracefully close the client
+			client.Close()
+
+			return
+		case 'p': // Pause or resume
+			fmt.Println("Pausing...")
+			paused = true
+			//c.events <- StateChange{CompletedTurns: turn, NewState: Executing}
+			c.events <- StateChange{CompletedTurns: turn, NewState: Paused}
+			err := client.Call(Stop, Request{}, new(Response))
+			if err != nil {
+				fmt.Println("Error resuming:", err)
+			}
+			// Wait for another 'p' to resume
+			for paused {
+				key := <-keypresses //waiting for the new key
+				if key == 'p' {
+					fmt.Println("Resuming...")
+					paused = false
+					err := client.Call(Continue, Request{}, new(Response))
+					if err != nil {
+						fmt.Println("Error resuming:", err)
+					}
+					c.events <- StateChange{CompletedTurns: turn, NewState: Executing}
+
+				} else if key == 's' {
+					// Handle save while paused
+					fmt.Println("Saving current state...")
+					worldMu.RLock()
+					saveBoard(p, res.Turns, res.NewWorld, c, filename)
+					worldMu.RUnlock()
+				} else if key == 'q' {
+					// Handle quit while paused
+					fmt.Println("Quitting after completing current turn...")
+					worldMu.RLock()
+					saveBoard(p, res.Turns, res.NewWorld, c, filename)
+					worldMu.RUnlock()
+					// Close keypresses channel to stop the loop
+					//close(keypresses)
+					// gracefully close the client
+					client.Close()
+					return
+				}
+			}
+		}
+	}
+}
+
+func makeCall(client *rpc.Client, p Params, world [][]byte, c distributorChannels, keypresses <-chan rune) Response {
 	request := Request{P: p, World: world}
 	response := new(Response)
-	fmt.Println("client call now")
+
+	// Initialize response.NewWorld with correct dimensions if it's empty
+	if len(response.NewWorld) == 0 {
+		response.NewWorld = make([][]byte, p.ImageHeight)
+		for i := range response.NewWorld {
+			response.NewWorld[i] = make([]byte, p.ImageWidth)
+		}
+	}
+
+	ticker := time.NewTicker(2 * time.Second) // Runs every 2 second
+	defer ticker.Stop()
+	done := make(chan bool)
+
+	go func() {
+		for {
+			select {
+			case <-ticker.C:
+				//pause.Lock()
+				req := Request{P: p, World: world}
+				//fmt.Println("tick")
+				//fmt.Println(request.P.Turns)
+				//fmt.Println("before Alivecount call")
+				err := client.Call(AliveCount, req, response)
+				if err != nil {
+					fmt.Println("Error when calling", err)
+				}
+				//fmt.Println("before accessing respone.AliveCellsCount")
+				aliveCellsCount := response.AliveCellsCount
+				//fmt.Println("before accessing response.Turns")
+				completedTurns := response.Turns
+				//fmt.Println("before sending the event")
+				//fmt.Println("aliveCellsCount:", aliveCellsCount)
+				//fmt.Println("completedTurns:", completedTurns)
+
+				// Send an event only if we've completed at least one turn
+				if completedTurns > 0 {
+					c.events <- AliveCellsCount{
+						CompletedTurns: completedTurns,
+						CellsCount:     aliveCellsCount,
+					}
+
+					fmt.Printf("after sending the event")
+				}
+				//pause.Unlock()
+			case <-done:
+				//fmt.Println("Done now")
+				return
+			}
+		}
+	}()
+	go handleKeypresses(client, p, response, c, keypresses)
+	turn := response.Turns
+	c.events <- StateChange{CompletedTurns: turn, NewState: Executing}
 	err := client.Call(CalculateNext, request, response)
 	if err != nil {
 		fmt.Println("Error when calling", err)
 	}
-	fmt.Println("finished client calling")
+	done <- true
+
+	//fmt.Println("finished client calling")
 	return *response
 }
 
 var server = flag.String("server", "127.0.0.1:8031", "IP:port string to connect to as server")
 
-func RunClient(p Params, world [][]byte, c distributorChannels) [][]byte {
+func RunClient(p Params, world [][]byte, c distributorChannels, keypresses <-chan rune) [][]byte {
 	// Define the server address flag (default to your server's IP and port)
 	//server := flag.String("server", "127.0.0.1:8031", "IP:port string to connect to as server")
 	flag.Parse()
@@ -104,21 +202,24 @@ func RunClient(p Params, world [][]byte, c distributorChannels) [][]byte {
 	}
 	defer client.Close()
 	fmt.Println("connected")
-	Res := makeCall(client, p, world)
+	Res := makeCall(client, p, world, c, keypresses)
 	fmt.Println("recieved")
+	worldMu.Lock()
 	world = Res.NewWorld
-	fmt.Printf("Recieved world of size: %d\n", len(world))
+	worldMu.Unlock()
+
+	//fmt.Printf("Recieved world of size: %d\n", len(world))
 
 	c.events <- FinalTurnComplete{
 		CompletedTurns: p.Turns,
-		Alive:          Res.AliveCellsCount,
+		Alive:          Res.AliveCells,
 	}
 
 	return world
 }
 
 // distributor divides the work between workers and interacts with other goroutines.
-func distributor(p Params, c distributorChannels) {
+func distributor(p Params, c distributorChannels, keypresses <-chan rune) {
 
 	world := make([][]byte, p.ImageHeight)
 	for i := range world {
@@ -138,20 +239,11 @@ func distributor(p Params, c distributorChannels) {
 			world[i][j] = eachByte
 		}
 	}
-
-	world = RunClient(p, world, c)
-	// TODO: Execute all turns of the Game of Life.
-	//turn := 0
-	//for ; turn < p.Turns; turn++ {
-	//	world = calculateNextState(p, world)
-	//	c.events <- StateChange{turn, Executing}
-	//}
-
+	world = RunClient(p, world, c, keypresses)
+	saveBoard(p, p.Turns, world, c, filename)
 	// TODO: send output back to IO
 	c.ioCommand <- ioOutput
 	c.ioFilename <- filename
-
-	//fmt.Println(world[p]"RPC server starting...")
 
 	for i := 0; i < p.ImageHeight; i++ {
 		for j := 0; j < p.ImageWidth; j++ {
